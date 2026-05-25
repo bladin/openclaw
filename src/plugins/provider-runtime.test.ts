@@ -1246,7 +1246,7 @@ describe("provider-runtime", () => {
           modelId: "gemini-3.1-flash-lite",
         },
       }),
-    ).toBe("gemini-3.1-flash-lite-preview");
+    ).toBe("gemini-3.1-flash-lite");
     expect(resolvePluginProvidersMock).toHaveBeenCalledTimes(1);
   });
 
