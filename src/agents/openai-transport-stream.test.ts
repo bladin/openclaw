@@ -2797,7 +2797,8 @@ describe("openai transport stream", () => {
       undefined,
     ) as { input?: Array<{ role?: string }> };
 
-    expect(params.input?.[0]?.role).toBe("system");
+    expect(params.instructions).toBe("system");
+    expect(params.input).toEqual([]);
   });
 
   it("adds explicit message item types for Responses system and user input items", () => {
@@ -2811,16 +2812,14 @@ describe("openai transport stream", () => {
       undefined,
     ) as { input?: Array<{ type?: string; role?: string; content?: unknown }> };
 
-    expect(params.input?.[0]).toMatchObject({
-      type: "message",
-      role: "system",
-      content: [{ type: "input_text", text: "system" }],
-    });
-    expect(params.input?.[1]).toMatchObject({
-      type: "message",
-      role: "user",
-      content: [{ type: "input_text", text: "hello" }],
-    });
+    expect(params.instructions).toBe("system");
+    expect(params.input).toEqual([
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "hello" }],
+      },
+    ]);
   });
 
   it("omits Responses reasoning params when model compat disables reasoning effort", () => {
@@ -2936,7 +2935,8 @@ describe("openai transport stream", () => {
       undefined,
     ) as { input?: Array<{ role?: string }> };
 
-    expect(params.input?.[0]?.role).toBe("developer");
+    expect(params.instructions).toBe("system");
+    expect(params.input).toEqual([]);
   });
 
   it("serializes Responses input messages with explicit message type and content parts", () => {
@@ -4811,9 +4811,8 @@ describe("openai transport stream", () => {
       undefined,
     ) as { input?: Array<{ content?: Array<{ type?: string; text?: string }> }> };
 
-    expect(params.input?.[0]?.content).toEqual([
-      { type: "input_text", text: "Stable prefix\nDynamic suffix" },
-    ]);
+    expect(params.instructions).toBe("Stable prefix\nDynamic suffix");
+    expect(params.input).toEqual([]);
   });
 
   it("defaults responses tool schemas to strict on native OpenAI routes", () => {
@@ -5310,7 +5309,8 @@ describe("openai transport stream", () => {
       undefined,
     ) as { input?: Array<{ role?: string }> };
 
-    expect(params.input?.[0]?.role).toBe("system");
+    expect(params.instructions).toBe("system");
+    expect(params.input).toEqual([]);
   });
 
   it("uses system role for Moonshot default-route completions providers", () => {
@@ -10183,9 +10183,7 @@ describe("buildOpenAICompletionsParams sanitizes reasoning replay fields", () =>
   });
 
   it("preserves reasoning_content replay for Gemma 4 openai-completions models", () => {
-    const assistant = getAssistantMessage(
-      buildReplayParams(gemma4Model, "reasoning_content"),
-    );
+    const assistant = getAssistantMessage(buildReplayParams(gemma4Model, "reasoning_content"));
 
     expect(assistant.reasoning_content).toBe("Need to answer politely.");
     expect(assistant).not.toHaveProperty("reasoning_details");
