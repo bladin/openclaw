@@ -126,7 +126,7 @@ import {
 } from "./runtime.js";
 import type { CreatePluginRuntimeOptions } from "./runtime/types.js";
 import type { PluginRuntime } from "./runtime/types.js";
-import { validateJsonSchemaValue } from "./schema-validator.js";
+import { validateJsonSchemaValue, rewriteMissingConfigDiagnostics } from "./schema-validator.js";
 import {
   buildPluginLoaderAliasMap,
   type PluginRuntimeModuleResolution,
@@ -1316,7 +1316,11 @@ function validatePluginConfig(params: {
   if (result.ok) {
     return ok(result.value as Record<string, unknown> | undefined);
   }
-  return resultError(result.errors.map((error) => error.text));
+  const errors =
+    value === undefined
+      ? rewriteMissingConfigDiagnostics({ originalValue: undefined, errors: result.errors, schema })
+      : result.errors;
+  return resultError(errors.map((error) => error.text));
 }
 
 function isEmptyPluginConfigJsonSchema(schema: Record<string, unknown>): boolean {
