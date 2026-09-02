@@ -337,18 +337,19 @@ function formatValidationErrors(
         : baseMessage;
       const safePath = sanitizeTerminalText(path);
       const safeMessage = sanitizeTerminalText(message);
-      return {
+      const formattedError: JsonSchemaValidationError = {
         path,
         message,
         text: `${safePath}: ${safeMessage}`,
-        ...(additionalProperty ? { additionalProperty } : {}),
-        ...(allowedValuesSummary
-          ? {
-              allowedValues: allowedValuesSummary.values,
-              allowedValuesHiddenCount: allowedValuesSummary.hiddenCount,
-            }
-          : {}),
       };
+      if (additionalProperty) {
+        formattedError.additionalProperty = additionalProperty;
+      }
+      if (allowedValuesSummary) {
+        formattedError.allowedValues = allowedValuesSummary.values;
+        formattedError.allowedValuesHiddenCount = allowedValuesSummary.hiddenCount;
+      }
+      return formattedError;
     });
   });
 }
