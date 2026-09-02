@@ -1,11 +1,13 @@
 package ai.openclaw.app.chat
 
-import androidx.room.Dao
-import androidx.room.Entity
-import androidx.room.Insert
-import androidx.room.OnConflictStrategy
-import androidx.room.Query
-import androidx.room.withTransaction
+import androidx.room3.Dao
+import androidx.room3.Entity
+import androidx.room3.Insert
+import androidx.room3.OnConflictStrategy
+import androidx.room3.Query
+import androidx.room3.withWriteTransaction
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
@@ -16,6 +18,45 @@ internal const val MAX_CACHED_SESSIONS = 50
 
 /** Upper bound of cached transcript rows per session; only the newest messages are kept. */
 internal const val MAX_CACHED_MESSAGES_PER_SESSION = 200
+
+@Serializable
+private data class CachedMessageContent(
+  val type: String,
+  val text: String? = null,
+  val mimeType: String? = null,
+  val fileName: String? = null,
+  val artifactId: String? = null,
+  val url: String? = null,
+  val openUrl: String? = null,
+  val alt: String? = null,
+  val width: Int? = null,
+  val height: Int? = null,
+  val sizeBytes: Long? = null,
+  val durationMs: Long? = null,
+  val playback: String? = null,
+)
+
+@Serializable
+private data class CachedMessagePayload(
+  val content: List<CachedMessageContent>,
+  val provenance: CachedMessageProvenance? = null,
+  @SerialName("__openclaw") val transcriptMarker: CachedTranscriptMarker? = null,
+  val senderLabel: String? = null,
+)
+
+@Serializable
+private data class CachedMessageProvenance(
+  val kind: String,
+  val sourceTool: String? = null,
+)
+
+@Serializable
+private data class CachedTranscriptMarker(
+  val kind: String,
+  val id: String? = null,
+  val tokensBefore: Double? = null,
+  val tokensAfter: Double? = null,
+)
 
 /**
  * Read-only offline cache of chat sessions and transcripts.
@@ -74,7 +115,14 @@ internal data class CachedSessionEntity(
   val agentId: String,
   val sessionKey: String,
   val displayName: String?,
+  val color: String?,
   val updatedAtMs: Long?,
+  val status: String?,
+  val startedAt: Long?,
+  val endedAt: Long?,
+  val runtimeMs: Long?,
+  val outputTokens: Long?,
+  val hasRunMetadata: Boolean,
   // Preserves gateway list order so offline session rows render in the familiar order.
   val rowOrder: Int,
 )
@@ -86,7 +134,7 @@ internal data class CachedMessageEntity(
   val sessionKey: String,
   val rowOrder: Int,
   val role: String,
-  // JSON array of text part strings; attachments/binary parts are never persisted.
+  // JSON array of text and managed-media references; attachment bytes are never persisted.
   val textPartsJson: String,
   val timestampMs: Long?,
   // Kept so live history reconciliation can match cached rows by identity key.
@@ -225,8 +273,10 @@ internal interface ChatCacheDao {
 class RoomChatTranscriptCache internal constructor(
   private val database: GatewayCacheDatabase,
 ) : ChatTranscriptCache {
-  private val json = Json
-  private val textPartsSerializer = ListSerializer(String.serializer())
+  private val json = Json { ignoreUnknownKeys = true }
+  private val cachedPayloadSerializer = CachedMessagePayload.serializer()
+  private val cachedContentSerializer = ListSerializer(CachedMessageContent.serializer())
+  private val legacyTextPartsSerializer = ListSerializer(String.serializer())
 
   override suspend fun loadLastDefaultAgentId(gatewayId: String): String? {
     val gateway = scopedGatewayId(gatewayId) ?: return null
@@ -258,6 +308,13 @@ class RoomChatTranscriptCache internal constructor(
         updatedAtMs = row.updatedAtMs,
         ownerAgentId = agent,
         displayName = row.displayName,
+        color = row.color,
+        status = row.status,
+        startedAt = row.startedAt,
+        endedAt = row.endedAt,
+        runtimeMs = row.runtimeMs,
+        outputTokens = row.outputTokens,
+        hasRunMetadata = row.hasRunMetadata,
       )
     }
   }
@@ -272,12 +329,46 @@ class RoomChatTranscriptCache internal constructor(
     val key = sessionKey.trim().takeIf { it.isNotEmpty() } ?: return emptyList()
     return database.dao().messages(gateway, agent, key).mapNotNull { row ->
       val role = normalizeVisibleChatMessageRole(row.role) ?: return@mapNotNull null
+      val payload = decodeCachedMessage(row.textPartsJson)
       ChatMessage(
         id = UUID.randomUUID().toString(),
         role = role,
-        content = decodeTextParts(row.textPartsJson).map { ChatMessageContent(type = "text", text = it) },
+        content =
+          payload.content.map { part ->
+            ChatMessageContent(
+              type = part.type,
+              text = part.text,
+              mimeType = part.mimeType,
+              fileName = part.fileName,
+              artifactId = part.artifactId,
+              url = part.url,
+              openUrl = part.openUrl,
+              alt = part.alt,
+              width = part.width,
+              height = part.height,
+              sizeBytes = part.sizeBytes,
+              durationMs = part.durationMs,
+              playback = part.playback,
+            )
+          },
         timestampMs = row.timestampMs,
         idempotencyKey = row.idempotencyKey,
+        // Canonical tree ids stay live-only; cached rows regain actions after history refresh.
+        entryId = null,
+        provenance =
+          payload.provenance?.let {
+            ChatMessageProvenance(kind = it.kind, sourceTool = it.sourceTool)
+          },
+        transcriptMarker =
+          payload.transcriptMarker?.let {
+            ChatTranscriptMarker(
+              kind = it.kind,
+              id = it.id,
+              tokensBefore = it.tokensBefore,
+              tokensAfter = it.tokensAfter,
+            )
+          },
+        senderLabel = payload.senderLabel,
       )
     }
   }
@@ -292,7 +383,7 @@ class RoomChatTranscriptCache internal constructor(
     val agent = scopedAgentId(agentId) ?: return
     val retainedKey = retainedSessionKey?.trim()?.takeIf { it.isNotEmpty() }
     val dao = database.dao()
-    database.withTransaction {
+    database.withWriteTransaction {
       val initialSessions = sessions.take(MAX_CACHED_SESSIONS)
       val needsRetainedRow = retainedKey != null && initialSessions.none { it.key == retainedKey }
       val retainedEntry = if (needsRetainedRow) sessions.firstOrNull { it.key == retainedKey } else null
@@ -304,7 +395,14 @@ class RoomChatTranscriptCache internal constructor(
               agentId = agent,
               sessionKey = entry.key,
               displayName = entry.displayName,
+              color = entry.color,
               updatedAtMs = entry.updatedAtMs,
+              status = entry.status,
+              startedAt = entry.startedAt,
+              endedAt = entry.endedAt,
+              runtimeMs = entry.runtimeMs,
+              outputTokens = entry.outputTokens,
+              hasRunMetadata = entry.hasRunMetadata,
               rowOrder = 0,
             )
           } ?: dao.session(gateway, agent, retainedKey)
@@ -319,7 +417,14 @@ class RoomChatTranscriptCache internal constructor(
             agentId = agent,
             sessionKey = session.key,
             displayName = session.displayName,
+            color = session.color,
             updatedAtMs = session.updatedAtMs,
+            status = session.status,
+            startedAt = session.startedAt,
+            endedAt = session.endedAt,
+            runtimeMs = session.runtimeMs,
+            outputTokens = session.outputTokens,
+            hasRunMetadata = session.hasRunMetadata,
             rowOrder = index,
           )
         }
@@ -341,29 +446,91 @@ class RoomChatTranscriptCache internal constructor(
     val gateway = scopedGatewayId(gatewayId) ?: return
     val agent = scopedAgentId(agentId) ?: return
     val key = sessionKey.trim().takeIf { it.isNotEmpty() } ?: return
-    // Text rows only: attachment/binary parts are dropped, and messages without any text are skipped.
+    // Persist small managed-media references, never attachment bytes. Cards remain visible offline
+    // even though their short-lived download capability must be reacquired after reconnecting.
     val rows =
       messages
         .mapNotNull { message ->
           val role = normalizeVisibleChatMessageRole(message.role) ?: return@mapNotNull null
-          val textParts = message.content.filter { it.type == "text" }.mapNotNull { it.text }
-          if (textParts.isEmpty()) return@mapNotNull null
-          Triple(message, role, textParts)
+          val content =
+            message.content.mapNotNull { part ->
+              when {
+                part.type == "text" && !part.text.isNullOrBlank() -> {
+                  CachedMessageContent(type = "text", text = part.text)
+                }
+
+                part.type == "image" && !part.artifactId.isNullOrBlank() && !part.url.isNullOrBlank() -> {
+                  CachedMessageContent(
+                    type = "image",
+                    mimeType = part.mimeType,
+                    fileName = part.fileName,
+                    artifactId = part.artifactId,
+                    url = part.url,
+                    openUrl = part.openUrl,
+                    alt = part.alt,
+                    width = part.width,
+                    height = part.height,
+                    sizeBytes = part.sizeBytes,
+                  )
+                }
+
+                part.type == "audio" || part.type == "video" || part.type == "file" -> {
+                  CachedMessageContent(
+                    type = part.type,
+                    mimeType = part.mimeType,
+                    fileName = part.fileName,
+                    artifactId = part.artifactId,
+                    url = part.url,
+                    openUrl = part.openUrl,
+                    alt = part.alt,
+                    width = part.width,
+                    height = part.height,
+                    sizeBytes = part.sizeBytes,
+                    durationMs = part.durationMs,
+                    playback = part.playback,
+                  )
+                }
+
+                else -> {
+                  null
+                }
+              }
+            }
+          if (content.isEmpty() && message.provenance == null && message.transcriptMarker == null) return@mapNotNull null
+          val payload =
+            CachedMessagePayload(
+              content = content,
+              provenance =
+                message.provenance?.let {
+                  CachedMessageProvenance(kind = it.kind, sourceTool = it.sourceTool)
+                },
+              transcriptMarker =
+                message.transcriptMarker?.let {
+                  CachedTranscriptMarker(
+                    kind = it.kind,
+                    id = it.id,
+                    tokensBefore = it.tokensBefore,
+                    tokensAfter = it.tokensAfter,
+                  )
+                },
+              senderLabel = message.senderLabel,
+            )
+          Triple(message, role, payload)
         }.takeLast(MAX_CACHED_MESSAGES_PER_SESSION)
-        .mapIndexed { index, (message, role, textParts) ->
+        .mapIndexed { index, (message, role, payload) ->
           CachedMessageEntity(
             gatewayId = gateway,
             agentId = agent,
             sessionKey = key,
             rowOrder = index,
             role = role,
-            textPartsJson = json.encodeToString(textPartsSerializer, textParts),
+            textPartsJson = json.encodeToString(cachedPayloadSerializer, payload),
             timestampMs = message.timestampMs,
             idempotencyKey = message.idempotencyKey,
           )
         }
     val dao = database.dao()
-    database.withTransaction {
+    database.withWriteTransaction {
       dao.deleteTranscript(gateway, agent, key)
       dao.insertMessages(rows)
       // A transcript may arrive for a session missing from the cached list (e.g. deep session
@@ -379,7 +546,14 @@ class RoomChatTranscriptCache internal constructor(
               agentId = agent,
               sessionKey = key,
               displayName = null,
+              color = null,
               updatedAtMs = null,
+              status = null,
+              startedAt = null,
+              endedAt = null,
+              runtimeMs = null,
+              outputTokens = null,
+              hasRunMetadata = false,
               rowOrder = dao.nextSessionRowOrder(gateway, agent),
             ),
         ),
@@ -394,7 +568,7 @@ class RoomChatTranscriptCache internal constructor(
   override suspend fun clearGateway(gatewayId: String) {
     val gateway = scopedGatewayId(gatewayId) ?: return
     val dao = database.dao()
-    database.withTransaction {
+    database.withWriteTransaction {
       dao.deleteMessages(gateway)
       dao.deleteSessionsForGateway(gateway)
       dao.deleteGatewayOwner(gateway)
@@ -410,7 +584,7 @@ class RoomChatTranscriptCache internal constructor(
     val agent = scopedAgentId(agentId) ?: return
     val key = sessionKey.trim().takeIf { it.isNotEmpty() } ?: return
     val dao = database.dao()
-    database.withTransaction {
+    database.withWriteTransaction {
       dao.deleteSessionRow(gateway, agent, key)
       dao.deleteTranscript(gateway, agent, key)
     }
@@ -420,5 +594,16 @@ class RoomChatTranscriptCache internal constructor(
 
   private fun scopedAgentId(agentId: String): String? = agentId.trim().takeIf { it.isNotEmpty() }
 
-  private fun decodeTextParts(encoded: String): List<String> = runCatching { json.decodeFromString(textPartsSerializer, encoded) }.getOrDefault(emptyList())
+  private fun decodeCachedMessage(encoded: String): CachedMessagePayload =
+    runCatching { json.decodeFromString(cachedPayloadSerializer, encoded) }.getOrElse {
+      // Offline transcript browsing is shipped behavior. Keep the previous string-array rows
+      // readable until a live history refresh naturally rewrites this disposable cache entry.
+      val content =
+        runCatching { json.decodeFromString(cachedContentSerializer, encoded) }.getOrElse {
+          runCatching { json.decodeFromString(legacyTextPartsSerializer, encoded) }
+            .getOrDefault(emptyList())
+            .map { CachedMessageContent(type = "text", text = it) }
+        }
+      CachedMessagePayload(content = content)
+    }
 }

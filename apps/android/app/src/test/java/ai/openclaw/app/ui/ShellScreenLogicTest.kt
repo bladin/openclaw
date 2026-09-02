@@ -13,6 +13,7 @@ import ai.openclaw.app.GatewayPendingDeviceSummary
 import ai.openclaw.app.GatewaySkillWorkshopProposal
 import ai.openclaw.app.GatewaySkillWorkshopSummary
 import ai.openclaw.app.chat.ChatSessionEntry
+import ai.openclaw.app.gatewayConnectionDisplay
 import ai.openclaw.app.i18n.resolveNativeText
 import ai.openclaw.app.i18n.verbatimText
 import ai.openclaw.app.normalizeOperatorScopes
@@ -32,13 +33,6 @@ import java.util.Locale
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
 class ShellScreenLogicTest {
-  @Test
-  fun bottomNavHidesForKeyboardAndCommandPalette() {
-    assertTrue(shellBottomNavVisible(keyboardVisible = false, commandOpen = false))
-    assertFalse(shellBottomNavVisible(keyboardVisible = true, commandOpen = false))
-    assertFalse(shellBottomNavVisible(keyboardVisible = false, commandOpen = true))
-  }
-
   @Test
   fun localizedUppercaseUsesTheSelectedAppLocale() {
     assertEquals("İLETİŞİM", localizedUppercase("iletişim", languageTag = "tr", fallbackLocale = Locale.US))
@@ -134,6 +128,19 @@ class ShellScreenLogicTest {
 
     nav.selectTab(Tab.Voice)
     nav.openDetailTab(Tab.ProvidersModels)
+    nav.back()
+    assertEquals(Tab.Chat, nav.activeTab)
+  }
+
+  @Test
+  fun sessionDashboardRoutePreservesTheOpeningSessionAndReturnsToChat() {
+    val nav = ShellNavigation()
+    nav.selectTab(Tab.Chat)
+
+    nav.openSessionDashboard("agent:main:phone")
+
+    assertEquals(Tab.Dashboard, nav.activeTab)
+    assertEquals("agent:main:phone", nav.dashboardSessionKey)
     nav.back()
     assertEquals(Tab.Chat, nav.activeTab)
   }
@@ -768,6 +775,7 @@ class ShellScreenLogicTest {
   fun settingsSectionTitlesGroupPowerSettingsByMeaning() {
     assertEquals("Connection", settingsSectionTitleForRoute(SettingsRoute.Gateway).resolveNativeText())
     assertEquals("Connection", settingsSectionTitleForRoute(SettingsRoute.NodesDevices).resolveNativeText())
+    assertEquals("Agents & automation", settingsSectionTitleForRoute(SettingsRoute.SystemAgent).resolveNativeText())
     assertEquals("Agents & automation", settingsSectionTitleForRoute(SettingsRoute.ProvidersModels).resolveNativeText())
     assertEquals("Agents & automation", settingsSectionTitleForRoute(SettingsRoute.Approvals).resolveNativeText())
     assertEquals("Agents & automation", settingsSectionTitleForRoute(SettingsRoute.CronJobs).resolveNativeText())
@@ -826,6 +834,21 @@ class ShellScreenLogicTest {
   fun gatewaySummaryFallsBackToGenericAuthLabelWithoutAKnownReason() {
     assertEquals("Authentication needed", gatewaySummary("auth failed", isConnected = false, gatewayConnectionProblem = null))
     assertEquals("Authentication needed", gatewaySummary("auth failed", isConnected = false, gatewayConnectionProblem = authProblem("SOME_UNMAPPED_CODE")))
+  }
+
+  @Test
+  fun gatewaySummaryPreservesNodeFailureWhileOperatorStaysConnected() {
+    val display =
+      gatewayConnectionDisplay(
+        operatorConnected = true,
+        nodeConnected = false,
+        operatorStatusText = "Connected",
+        nodeStatusText = "Gateway error: pairing required",
+        operatorProblem = null,
+        nodeProblem = authProblem("PAIRING_REQUIRED"),
+      )
+
+    assertEquals("Connected (node offline)", gatewaySummary(display))
   }
 
   @Test

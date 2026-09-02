@@ -9,6 +9,7 @@ import {
   BrowserProfileUnavailableError,
   BrowserTabNotFoundError,
   BrowserTargetAmbiguousError,
+  toBrowserErrorResponse,
 } from "../errors.js";
 import {
   assertBrowserNavigationAllowed,
@@ -17,6 +18,7 @@ import {
 import { getBrowserProfileCapabilities } from "../profile-capabilities.js";
 import type { BrowserRouteContext, ProfileContext } from "../server-context.js";
 import { isProfileRestartRequiredError } from "../server-context.lifecycle.js";
+import { clearSnapshotKeysForTab } from "../snapshot-delta-cache.js";
 import { resolveTargetIdFromTabs } from "../target-id.js";
 import { browserNavigationPolicyForProfile, resolveProfileContext } from "./agent.shared.js";
 import { readRouteNonNegativeInteger } from "./route-numeric.js";
@@ -128,11 +130,16 @@ async function redactBlockedTabUrls(params: {
         ...params.navigationPolicy,
       });
       redactedTabs.push(tab);
-    } catch {
-      // Hide blocked URLs while preserving tab identity for safe operations.
+    } catch (error) {
+      const failure = toBrowserErrorResponse(error);
+      // Preserve safe tab management without turning a DNS failure into a policy denial.
       redactedTabs.push({
         ...tab,
         url: "",
+        urlUnavailableReason:
+          failure && "reason" in failure && failure.reason === "navigation_blocked"
+            ? "navigation_blocked"
+            : "navigation_check_failed",
       });
     }
   }
@@ -320,7 +327,12 @@ export function registerBrowserTabRoutes(app: BrowserRouteRegistrar, ctx: Browse
       ctx,
       targetId,
       mutate: async (profileCtx, id) => {
-        await profileCtx.closeTab(id, targetIdMode === "raw" ? { exactTargetId: true } : undefined);
+        const canonicalTargetId = await profileCtx.closeTab(
+          id,
+          targetIdMode === "raw" ? { exactTargetId: true } : undefined,
+        );
+        clearSnapshotKeysForTab(ctx, profileCtx.profile.name, canonicalTargetId);
+        return canonicalTargetId;
       },
     });
   });
@@ -397,6 +409,7 @@ export function registerBrowserTabRoutes(app: BrowserRouteRegistrar, ctx: Browse
             throw new BrowserTabNotFoundError();
           }
           await profileCtx.closeTab(target.targetId, { exactTargetId: true });
+          clearSnapshotKeysForTab(ctx, profileCtx.profile.name, target.targetId);
           return { ok: true, targetId: target.targetId };
         }
 

@@ -1,7 +1,15 @@
 /** Covers plugin schema validation for manifests and exported config schemas. */
 import { Format } from "typebox/format";
-import { describe, expect, it } from "vitest";
-import { validateJsonSchemaValue, rewriteMissingConfigDiagnostics } from "./schema-validator.js";
+import { describe, expect, it, vi } from "vitest";
+import { parseJsonSchemaIssuePath, validateJsonSchemaValue } from "./schema-validator.js";
+
+// Config validation is a CLI startup dependency; codecs and value transforms are not.
+vi.mock("typebox/compile", () => {
+  throw new Error("schema validation must not load the TypeBox value-transform compiler");
+});
+vi.mock("typebox/value", () => {
+  throw new Error("schema validation must not load TypeBox value transforms");
+});
 
 const jsonSchemaThenKeyword = ["the", "n"].join("");
 
@@ -71,6 +79,14 @@ function expectUriValidationCase(params: {
 }
 
 describe("schema validator", () => {
+  it.each([
+    ["<root>", []],
+    ["items.0.enabled", ["items", 0, "enabled"]],
+    ["items.100001.enabled", ["items", "100001", "enabled"]],
+  ])("parses JSON Schema issue path %s", (path, expected) => {
+    expect(parseJsonSchemaIssuePath(path)).toEqual(expected);
+  });
+
   it("can apply JSON Schema defaults while validating", () => {
     const value = {};
     const result = validateJsonSchemaValue({
@@ -2127,122 +2143,6 @@ describe("schema validator", () => {
   it("does not weaken the global TypeBox format registry", () => {
     expect(Format.Get("email")?.("not an email")).toBe(false);
     expect(Format.Get("uuid")?.("not a uuid")).toBe(false);
-  });
-});
-
-describe("rewriteMissingConfigDiagnostics", () => {
-  it("rewrites all-required-property errors when original value was undefined", () => {
-    const schema = {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        serverUrl: { type: "string" },
-        apiKey: { type: "string" },
-      },
-      required: ["serverUrl", "apiKey"],
-    };
-    const result = validateJsonSchemaValue({
-      schema,
-      cacheKey: "rewrite-test-undefined",
-      value: {},
-      applyDefaults: true,
-    });
-    expect(result.ok).toBe(false);
-    if (result.ok) {
-      return;
-    }
-    const rewritten = rewriteMissingConfigDiagnostics({
-      originalValue: undefined,
-      errors: result.errors,
-      schema,
-    });
-    expect(rewritten).toHaveLength(1);
-    expect(rewritten[0]!.message).toContain("missing required config");
-    expect(rewritten[0]!.path).toBe("<root>");
-  });
-
-  it("preserves non-required errors when original value was undefined", () => {
-    const schema = {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        value: { type: "boolean" },
-      },
-      required: ["value"],
-    };
-    const result = validateJsonSchemaValue({
-      schema,
-      cacheKey: "rewrite-test-non-required",
-      value: { value: "not-a-bool" },
-      applyDefaults: true,
-    });
-    expect(result.ok).toBe(false);
-    if (result.ok) {
-      return;
-    }
-    const rewritten = rewriteMissingConfigDiagnostics({
-      originalValue: undefined,
-      errors: result.errors,
-      schema,
-    });
-    expect(rewritten).toEqual(result.errors);
-  });
-
-  it("does not rewrite when original value was provided", () => {
-    const schema = {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        value: { type: "boolean" },
-      },
-      required: ["value"],
-    };
-    const result = validateJsonSchemaValue({
-      schema,
-      cacheKey: "rewrite-test-provided",
-      value: {},
-      applyDefaults: true,
-    });
-    expect(result.ok).toBe(false);
-    if (result.ok) {
-      return;
-    }
-    const rewritten = rewriteMissingConfigDiagnostics({
-      originalValue: {},
-      errors: result.errors,
-      schema,
-    });
-    expect(rewritten).toEqual(result.errors);
-  });
-
-  it("preserves errors when dependency schema hydrates from defaults", () => {
-    const schema = {
-      type: "object",
-      properties: {
-        flag: {
-          type: "boolean",
-          default: true,
-        },
-      },
-      dependencies: {
-        flag: {
-          properties: {
-            mode: {
-              type: "string",
-              default: "auto",
-            },
-          },
-          required: ["mode"],
-        },
-      },
-    };
-    const result = validateJsonSchemaValue({
-      schema,
-      cacheKey: "rewrite-test-dep-defaults",
-      value: {},
-      applyDefaults: true,
-    });
-    expect(result.ok).toBe(true);
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

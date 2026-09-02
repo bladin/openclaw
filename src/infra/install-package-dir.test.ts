@@ -5,7 +5,12 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runCommandWithTimeout, type CommandOptions, type SpawnResult } from "../process/exec.js";
 import { createSuiteTempRootTracker } from "../test-helpers/temp-dir.js";
-import { installPackageDir } from "./install-package-dir.js";
+import { npmCommandFailureCases } from "../test-utils/npm-spec-install-test-helpers.js";
+import {
+  installPackageDir,
+  requestDeferredPackageDirInstall,
+  resolvePackageDirInstallTransaction,
+} from "./install-package-dir.js";
 
 vi.mock("../process/exec.js", async () => {
   const actual = await vi.importActual<typeof import("../process/exec.js")>("../process/exec.js");
@@ -55,10 +60,6 @@ function normalizeComparablePath(filePath: string): string {
   const basename =
     process.platform === "win32" ? path.basename(resolved).toLowerCase() : path.basename(resolved);
   return path.join(comparableParent, basename);
-}
-
-function createFsError(code: string, message = code): NodeJS.ErrnoException {
-  return Object.assign(new Error(message), { code });
 }
 
 async function expectMissingPath(filePath: string): Promise<void> {
@@ -179,37 +180,6 @@ describe("installPackageDir", () => {
   const fixtureRootTracker = createSuiteTempRootTracker({
     prefix: "openclaw-install-package-dir-",
   });
-  const emptyNpmFailureCases = [
-    {
-      label: "exit code",
-      npmResult: {
-        stdout: "",
-        stderr: "",
-        code: 1,
-        signal: null,
-        killed: false,
-        termination: "exit",
-      },
-      expectedDetail: "exit code 1",
-    },
-    {
-      label: "signal",
-      npmResult: {
-        stdout: "",
-        stderr: "",
-        code: null,
-        signal: "SIGKILL",
-        killed: true,
-        termination: "signal",
-      },
-      expectedDetail: "signal SIGKILL",
-    },
-  ] satisfies Array<{
-    label: string;
-    npmResult: SpawnResult;
-    expectedDetail: string;
-  }>;
-
   async function installWithNpmResult(npmResult: SpawnResult) {
     await fixtureRootTracker.setup();
     const fixtureRoot = await fixtureRootTracker.make("case");
@@ -281,6 +251,67 @@ describe("installPackageDir", () => {
     ).resolves.toHaveLength(0);
   });
 
+  it("checks update authority before displacing the existing install", async () => {
+    await fixtureRootTracker.setup();
+    const fixtureRoot = await fixtureRootTracker.make("case");
+    const { sourceDir, targetDir } = await createExistingInstallFixture(fixtureRoot);
+    let backupReached = false;
+    const result = await installPackageDir({
+      sourceDir,
+      targetDir,
+      mode: "update",
+      timeoutMs: 1_000,
+      copyErrorPrefix: "failed to copy plugin",
+      hasDeps: false,
+      depsLogMessage: "unused",
+      beforePersistentApply() {
+        throw new Error("update authority closed");
+      },
+      async afterBackup() {
+        backupReached = true;
+        return { ok: true };
+      },
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: "failed to copy plugin: Error: update authority closed",
+    });
+    expect(backupReached).toBe(false);
+    await expect(fs.readFile(path.join(targetDir, "marker.txt"), "utf8")).resolves.toBe("old");
+  });
+
+  it("restores edits detected after the existing install moves to backup", async () => {
+    await fixtureRootTracker.setup();
+    const fixtureRoot = await fixtureRootTracker.make("case");
+    const { installBaseDir, sourceDir, targetDir } =
+      await createExistingInstallFixture(fixtureRoot);
+
+    const result = await installPackageDir({
+      sourceDir,
+      targetDir,
+      mode: "update",
+      timeoutMs: 1_000,
+      copyErrorPrefix: "failed to copy plugin",
+      hasDeps: false,
+      depsLogMessage: "Installing deps…",
+      afterBackup: async (backupDir) => {
+        await fs.writeFile(path.join(backupDir, "local.txt"), "keep me");
+        return { ok: false, error: "existing install changed" };
+      },
+    });
+
+    expect(result).toEqual({ ok: false, error: "existing install changed" });
+    await expect(fs.readFile(path.join(targetDir, "marker.txt"), "utf8")).resolves.toBe("old");
+    await expect(fs.readFile(path.join(targetDir, "local.txt"), "utf8")).resolves.toBe("keep me");
+    await expect(
+      listMatchingDirs(installBaseDir, ".openclaw-install-stage-"),
+    ).resolves.toHaveLength(0);
+    await expect(
+      fs.readdir(path.join(installBaseDir, ".openclaw-install-backups")),
+    ).resolves.toHaveLength(0);
+  });
+
   it("restores the original install if publish rename fails", async () => {
     await fixtureRootTracker.setup();
     const fixtureRoot = await fixtureRootTracker.make("case");
@@ -319,7 +350,7 @@ describe("installPackageDir", () => {
     await expect(fs.readdir(backupRoot)).resolves.toHaveLength(0);
   });
 
-  it("publishes the staged install through the copy fallback when rename crosses devices", async () => {
+  it("publishes through the staged-copy path when source hardlinks are rejected", async () => {
     await fixtureRootTracker.setup();
     const fixtureRoot = await fixtureRootTracker.make("case");
     const sourceDir = path.join(fixtureRoot, "source");
@@ -329,17 +360,15 @@ describe("installPackageDir", () => {
     await fs.writeFile(path.join(sourceDir, "marker.txt"), "new");
 
     const realRename = fs.rename.bind(fs);
-    let exdevMoves = 0;
+    let directMoves = 0;
     vi.spyOn(fs, "rename").mockImplementation(async (...args: Parameters<typeof fs.rename>) => {
       const [from, to] = args;
       const fromPath = String(from);
       if (
-        exdevMoves === 0 &&
         path.basename(fromPath).startsWith(".openclaw-install-stage-") &&
         normalizeComparablePath(String(to)) === normalizeComparablePath(targetDir)
       ) {
-        exdevMoves += 1;
-        throw createFsError("EXDEV", "cross-device link not permitted");
+        directMoves += 1;
       }
       return await realRename(...args);
     });
@@ -355,7 +384,7 @@ describe("installPackageDir", () => {
     });
 
     expect(result).toEqual({ ok: true });
-    expect(exdevMoves).toBe(1);
+    expect(directMoves).toBe(0);
     await expect(fs.readFile(path.join(targetDir, "marker.txt"), "utf8")).resolves.toBe("new");
     await expect(
       listMatchingDirs(installBaseDir, ".openclaw-install-stage-"),
@@ -443,7 +472,7 @@ describe("installPackageDir", () => {
 
       expect(result.ok).toBe(false);
       if (!result.ok) {
-        expect(result.error).toContain("Hardlinked source file is not allowed");
+        expect(result.error).toContain("Refusing to move hardlinked file");
       }
       await expect(fs.readFile(path.join(targetDir, "marker.txt"), "utf8")).resolves.toBe("old");
     },
@@ -472,7 +501,7 @@ describe("installPackageDir", () => {
 
       expect(result.ok).toBe(false);
       if (!result.ok) {
-        expect(result.error).toContain("Hardlinked source file is not allowed");
+        expect(result.error).toContain("Refusing to move hardlinked file");
       }
       await expect(fs.readFile(path.join(targetDir, "marker.txt"), "utf8")).resolves.toBe("old");
     },
@@ -506,7 +535,7 @@ describe("installPackageDir", () => {
 
       expect(result.ok).toBe(false);
       if (!result.ok) {
-        expect(result.error).toContain("Hardlinked source file is not allowed");
+        expect(result.error).toContain("Refusing to move hardlinked file");
       }
       await expectMissingPath(path.join(targetDir, "marker.txt"));
     },
@@ -805,8 +834,8 @@ describe("installPackageDir", () => {
     }
   });
 
-  it.each(emptyNpmFailureCases)(
-    "includes $label when npm dependency install fails without output",
+  it.each(npmCommandFailureCases)(
+    "preserves $label when npm dependency install fails",
     async ({ npmResult, expectedDetail }) => {
       const result = await installWithNpmResult(npmResult);
 
@@ -818,4 +847,36 @@ describe("installPackageDir", () => {
       }
     },
   );
+
+  it("restores the previous package when a deferred update rolls back", async () => {
+    await fixtureRootTracker.setup();
+    const fixtureRoot = await fixtureRootTracker.make("deferred-rollback");
+    const sourceDir = path.join(fixtureRoot, "source");
+    const targetDir = path.join(fixtureRoot, "plugins", "demo");
+    await fs.mkdir(sourceDir, { recursive: true });
+    await fs.mkdir(targetDir, { recursive: true });
+    await fs.writeFile(path.join(sourceDir, "version.txt"), "v2", "utf8");
+    await fs.writeFile(path.join(targetDir, "version.txt"), "v1", "utf8");
+
+    const result = await installPackageDir(
+      requestDeferredPackageDirInstall({
+        sourceDir,
+        targetDir,
+        mode: "update",
+        timeoutMs: 1_000,
+        copyErrorPrefix: "failed to copy plugin",
+        hasDeps: false,
+        depsLogMessage: "",
+      }),
+    );
+
+    expect(result.ok).toBe(true);
+    const transaction = result.ok ? resolvePackageDirInstallTransaction(result) : undefined;
+    if (!transaction) {
+      throw new Error("expected deferred package transaction");
+    }
+    expect(await fs.readFile(path.join(targetDir, "version.txt"), "utf8")).toBe("v2");
+    await transaction.rollback();
+    expect(await fs.readFile(path.join(targetDir, "version.txt"), "utf8")).toBe("v1");
+  });
 });

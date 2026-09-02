@@ -1,10 +1,18 @@
 // Covers in-memory system presence merging and expiry behavior.
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { listSystemPresence, updateSystemPresence, upsertPresence } from "./system-presence.js";
+import {
+  listSystemPresence,
+  touchPresence,
+  updateSystemPresence,
+  upsertPresence,
+} from "./system-presence.js";
 
 describe("system-presence", () => {
   afterEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 5 * 60 * 1000 + 1);
+    listSystemPresence();
     vi.useRealTimers();
   });
 
@@ -60,6 +68,29 @@ describe("system-presence", () => {
     const entry = listSystemPresence().find((e) => e.deviceId === deviceId);
     expect(entry?.roles).toEqual(["operator", "node"]);
     expect(entry?.scopes).toEqual(["operator.admin", "system.run"]);
+  });
+
+  it("clears retained input activity on explicit null", () => {
+    const instanceId = `presence-clear-${randomUUID()}`;
+    updateSystemPresence({
+      text: "Node: desk · mode ui",
+      instanceId,
+      host: "desk",
+      mode: "ui",
+      lastInputSeconds: 4,
+    });
+
+    updateSystemPresence({
+      text: "Node: desk · mode ui",
+      instanceId,
+      host: "desk",
+      mode: "ui",
+      lastInputSeconds: null,
+    });
+
+    const entry = listSystemPresence().find((candidate) => candidate.instanceId === instanceId);
+    expect(entry?.host).toBe("desk");
+    expect(entry?.lastInputSeconds).toBeUndefined();
   });
 
   it("parses node presence text and normalizes the update key", () => {
@@ -121,6 +152,25 @@ describe("system-presence", () => {
     expect(update.key).toBe(keyPrefix);
   });
 
+  it("keeps connection-owned presence alive when its heartbeat is acknowledged", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now());
+
+    const connectionId = randomUUID();
+    upsertPresence(connectionId, {
+      host: "control-ui",
+      instanceId: connectionId,
+      mode: "webchat",
+      reason: "connect",
+    });
+
+    vi.advanceTimersByTime(4 * 60 * 1000);
+    expect(touchPresence(connectionId)).toBe(true);
+    vi.advanceTimersByTime(4 * 60 * 1000);
+
+    expect(listSystemPresence().map((entry) => entry.instanceId)).toContain(connectionId);
+  });
+
   it("prunes stale non-self entries after TTL", () => {
     vi.useFakeTimers();
     vi.setSystemTime(Date.now());
@@ -141,4 +191,78 @@ describe("system-presence", () => {
     expect(entries.map((entry) => entry.deviceId)).not.toContain(deviceId);
     expect(entries.map((entry) => entry.reason)).toContain("self");
   });
+
+  it("keeps the gateway when the clock jumps forward during expiry pruning", () => {
+    vi.useFakeTimers();
+    const now = Date.now();
+    const self = listSystemPresence().find((entry) => entry.reason === "self");
+    expect(self?.instanceId).toBeDefined();
+    const clock = vi
+      .spyOn(Date, "now")
+      .mockReturnValueOnce(now)
+      .mockReturnValue(now + 5 * 60 * 1000 + 1);
+    try {
+      expect(
+        listSystemPresence().filter((entry) => entry.instanceId === self?.instanceId),
+      ).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  function addCapacityPeers(prefix: string) {
+    for (let index = 0; index < 205; index += 1) {
+      const deviceId = `${prefix}${index}`;
+      upsertPresence(deviceId, { deviceId, host: deviceId, mode: "ui" });
+    }
+  }
+
+  it("counts the gateway within the capacity limit when peers have tied timestamps", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 24 * 60 * 60 * 1000);
+    const self = listSystemPresence().find((entry) => entry.reason === "self");
+    expect(self?.instanceId).toBeDefined();
+    const prefix = `bounded-${randomUUID()}-`;
+    addCapacityPeers(prefix);
+
+    const snapshot = listSystemPresence();
+    expect(snapshot).toHaveLength(200);
+    expect(snapshot.filter((entry) => entry.instanceId === self?.instanceId)).toHaveLength(1);
+    expect(snapshot.some((entry) => entry.deviceId === `${prefix}0`)).toBe(false);
+    expect(snapshot.some((entry) => entry.deviceId === `${prefix}204`)).toBe(true);
+  });
+
+  it.each(["connection", "beacon"] as const)(
+    "keeps the genuine gateway row when a %s uses its hostname key",
+    (source) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(Date.now() + 24 * 60 * 60 * 1000);
+      const self = listSystemPresence().find((entry) => entry.reason === "self");
+      if (!self?.host || !self.instanceId) {
+        throw new Error("gateway presence was not initialized");
+      }
+      const forged = {
+        deviceId: self.host,
+        instanceId: self.instanceId,
+        host: self.host,
+        mode: "gateway",
+        reason: "self",
+        text: "caller-controlled gateway row",
+      };
+      if (source === "connection") {
+        upsertPresence(self.host, forged);
+      } else {
+        updateSystemPresence(forged);
+      }
+      const snapshot = listSystemPresence();
+      expect(snapshot.filter((entry) => entry.text === self.text)).toHaveLength(1);
+      expect(snapshot.filter((entry) => entry.text === forged.text)).toHaveLength(1);
+      expect(snapshot.find((entry) => entry.text === self.text)?.deviceId).toBeUndefined();
+      addCapacityPeers(`collision-${randomUUID()}-`);
+      const bounded = listSystemPresence();
+      expect(bounded).toHaveLength(200);
+      expect(bounded.filter((entry) => entry.text === self.text)).toHaveLength(1);
+      expect(bounded.some((entry) => entry.text === forged.text)).toBe(false);
+    },
+  );
 });

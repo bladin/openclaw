@@ -1,10 +1,13 @@
 import com.android.build.api.variant.impl.VariantOutputImpl
+import org.gradle.api.tasks.Exec
+import org.gradle.api.tasks.PathSensitivity
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Properties
 
 val dnsjavaInetAddressResolverService = "META-INF/services/java.net.spi.InetAddressResolverProvider"
+val openClawAndroidApplicationId = "ai.openclaw.app"
 val openClawAndroidVersionFile = rootProject.file("Config/Version.properties")
 val thirdPartyLicensesDir = rootProject.file("THIRD_PARTY_LICENSES")
 val openClawAndroidVersionProperties =
@@ -144,12 +147,15 @@ android {
   sourceSets {
     getByName("main") {
       assets.directories.add("../../shared/OpenClawKit/Sources/OpenClawKit/Resources")
+      assets.directories.add(rootProject.file("../../ui/public/provider-icons").path)
+      assets.directories.add("../../shared/mermaid/assets")
       assets.directories.add(thirdPartyLicensesDir.path)
     }
   }
 
   defaultConfig {
-    applicationId = "ai.openclaw.app"
+    applicationId = openClawAndroidApplicationId
+    resValue("string", "application_id", openClawAndroidApplicationId)
     minSdk = 31
     targetSdk = 36
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -189,6 +195,9 @@ android {
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
     }
     debug {
+      applicationIdSuffix = ".debug"
+      versionNameSuffix = "-debug"
+      resValue("string", "application_id", "$openClawAndroidApplicationId.debug")
       isMinifyEnabled = false
     }
   }
@@ -204,6 +213,7 @@ android {
   buildFeatures {
     compose = true
     buildConfig = true
+    resValues = true
   }
 
   androidResources {
@@ -268,6 +278,7 @@ android {
 }
 
 androidComponents {
+  val adbExecutable = sdkComponents.adb
   onVariants { variant ->
     variant.outputs
       .filterIsInstance<VariantOutputImpl>()
@@ -283,6 +294,24 @@ androidComponents {
           }
         output.outputFileName = outputFileName
       }
+
+    if (variant.buildType == "debug") {
+      val variantNameCapitalized = variant.name.replaceFirstChar(Char::titlecase)
+      tasks.register<Exec>("run$variantNameCapitalized") {
+        group = "install"
+        description = "Installs and launches the ${variant.name} app."
+        dependsOn("install$variantNameCapitalized")
+        commandLine(
+          adbExecutable.get().asFile.absolutePath,
+          "shell",
+          "am",
+          "start",
+          "-W",
+          "-n",
+          "${variant.applicationId.get()}/$openClawAndroidApplicationId.MainActivity",
+        )
+      }
+    }
   }
 }
 kotlin {
@@ -293,6 +322,7 @@ kotlin {
 }
 
 ktlint {
+  version.set(libs.versions.ktlint.cli)
   android.set(true)
   ignoreFailures.set(false)
   filter {
@@ -318,6 +348,7 @@ dependencies {
   implementation(libs.androidx.compose.ui)
   implementation(libs.androidx.compose.ui.tooling.preview)
   implementation(libs.androidx.compose.material3)
+  implementation(libs.androidx.compose.material3.adaptive.navigation.suite)
   // material-icons-extended pulled in full icon set (~20 MB DEX). Only ~18 icons used.
   // R8 will tree-shake unused icons when minify is enabled on release builds.
   implementation(libs.androidx.compose.material.icons.extended)
@@ -336,6 +367,10 @@ dependencies {
   ksp(libs.androidx.room.compiler)
   implementation(libs.androidx.exifinterface)
   implementation(libs.okhttp)
+  implementation(libs.media3.datasource.okhttp)
+  implementation(libs.media3.exoplayer)
+  implementation(libs.media3.session)
+  implementation(libs.media3.ui)
   implementation(libs.bcprov)
   implementation(libs.coil.compose)
   implementation(libs.coil.svg)
@@ -362,6 +397,7 @@ dependencies {
   testImplementation(libs.kotest.assertions.core)
   testImplementation(libs.mockwebserver)
   testImplementation(libs.robolectric)
+  testImplementation(libs.androidx.compose.ui.test.junit4)
   testRuntimeOnly(libs.junit.vintage.engine)
 
   androidTestImplementation(libs.androidx.test.ext.junit)
@@ -412,8 +448,31 @@ val validateThirdPartyLicenseAssets =
     }
   }
 
+val generateMermaidAssets =
+  tasks.register<Exec>("generateMermaidAssets") {
+    val repositoryRoot = rootProject.projectDir.resolve("../..").canonicalFile
+    workingDir(repositoryRoot)
+    commandLine("pnpm", "--filter", "@openclaw/mermaid-renderer", "build")
+    inputs
+      .files(
+        fileTree(repositoryRoot.resolve("packages/mermaid-renderer")) {
+          exclude("node_modules/**", "dist/**")
+        },
+        fileTree(repositoryRoot.resolve("packages/normalization-core")) {
+          include("src/**", "package.json")
+        },
+        repositoryRoot.resolve("tsconfig.json"),
+      ).withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.file(repositoryRoot.resolve("pnpm-lock.yaml"))
+    outputs.dir(repositoryRoot.resolve("apps/shared/mermaid/assets/mermaid"))
+  }
+
 tasks.matching { task -> task.name == "preBuild" }.configureEach {
-  dependsOn(validateThirdPartyLicenseAssets)
+  dependsOn(validateThirdPartyLicenseAssets, generateMermaidAssets)
+}
+
+tasks.matching { task -> task.name.startsWith("merge") && task.name.endsWith("Assets") }.configureEach {
+  dependsOn(generateMermaidAssets)
 }
 
 androidComponents {

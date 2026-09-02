@@ -2,9 +2,11 @@
 import { EventEmitter } from "node:events";
 import net from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 
 const mocks = vi.hoisted(() => ({
   ensurePortAvailable: vi.fn<(port: number, host?: string) => Promise<void>>(),
+  resolveSshClient: vi.fn<() => string | null>(() => "/usr/bin/ssh"),
   spawn: vi.fn(),
 }));
 
@@ -18,6 +20,11 @@ vi.mock("node:child_process", async (importOriginal) => ({
   spawn: mocks.spawn,
 }));
 
+vi.mock("./ssh-client.js", () => ({
+  resolveSshClient: mocks.resolveSshClient,
+}));
+
+import { getFreePort } from "../test-utils/ports.js";
 import { PortInUseError } from "./ports.js";
 import { parseSshTarget, startSshPortForward } from "./ssh-tunnel.js";
 
@@ -38,6 +45,19 @@ describe("parseSshTarget", () => {
     });
   });
 
+  it("preserves OpenSSH alias and username tokens", () => {
+    expect(parseSshTarget("me+prod@prod+gpu:2222")).toEqual({
+      user: "me+prod",
+      host: "prod+gpu",
+      port: 2222,
+    });
+    expect(parseSshTarget(String.raw`DOMAIN\alice@jump+gpu`)).toEqual({
+      user: String.raw`DOMAIN\alice`,
+      host: "jump+gpu",
+      port: 22,
+    });
+  });
+
   it("rejects invalid hosts and ports", () => {
     expect(parseSshTarget("")).toBeNull();
     expect(parseSshTarget("me@example.com:0")).toBeNull();
@@ -46,7 +66,17 @@ describe("parseSshTarget", () => {
     expect(parseSshTarget("me@example.com:not-a-port")).toBeNull();
     expect(parseSshTarget("-V")).toBeNull();
     expect(parseSshTarget("me@-badhost")).toBeNull();
+    expect(parseSshTarget("-oProxyCommand=touch@example.com")).toBeNull();
     expect(parseSshTarget("-oProxyCommand=echo")).toBeNull();
+  });
+
+  it("rejects targets that cannot be embedded in ssh config directives", () => {
+    expect(parseSshTarget("example.com\n  ProxyCommand touch marker")).toBeNull();
+    expect(parseSshTarget("example.com\r  ProxyCommand touch marker")).toBeNull();
+    expect(parseSshTarget("example.com\n  ProxyCommand touch marker:2222")).toBeNull();
+    expect(parseSshTarget("me\nProxyCommand=touch@example.com")).toBeNull();
+    expect(parseSshTarget("bad host")).toBeNull();
+    expect(parseSshTarget("me name@example.com")).toBeNull();
   });
 
   it("rejects hostnames with stray leading or trailing colons", () => {
@@ -73,6 +103,8 @@ describe("startSshPortForward", () => {
       });
     }
     mocks.ensurePortAvailable.mockReset();
+    mocks.resolveSshClient.mockReset();
+    mocks.resolveSshClient.mockReturnValue("/usr/bin/ssh");
     mocks.spawn.mockReset();
   });
 
@@ -107,6 +139,22 @@ describe("startSshPortForward", () => {
       return child;
     });
   }
+
+  it("fails before port probing when no trusted SSH client is installed", async () => {
+    mocks.resolveSshClient.mockReturnValueOnce(null);
+
+    await expect(
+      startSshPortForward({
+        target: "me@example.com",
+        localPortPreferred: 43210,
+        remotePort: 18789,
+        timeoutMs: 250,
+      }),
+    ).rejects.toThrow("trusted SSH client not found in system directories");
+
+    expect(mocks.ensurePortAvailable).not.toHaveBeenCalled();
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  });
 
   it("scopes the preferred-port preflight to the IPv4 loopback interface", async () => {
     const sentinel = new Error("stop before spawning ssh");
@@ -165,56 +213,196 @@ describe("startSshPortForward", () => {
     await tunnel.stop();
   });
 
-  it("rejects with the spawn error when ssh binary is missing", async () => {
-    vi.useFakeTimers();
-    const spawnError = new Error("ENOENT: no such file or directory, spawn /usr/bin/ssh");
-    (spawnError as NodeJS.ErrnoException).code = "ENOENT";
-    const kill = vi.fn(() => false);
-    mocks.spawn.mockImplementation(() => {
-      const child = new EventEmitter() as EventEmitter & {
+  it.each(["term", "kill"] as const)(
+    "keeps every stop caller pending until the child exits after %s",
+    async (exitAfter) => {
+      spawnFakeSshListening();
+      const tunnel = await startSshPortForward({
+        target: "me@example.com:2222",
+        localPortPreferred: await getFreePort(),
+        remotePort: 18789,
+        timeoutMs: 1000,
+      });
+      const child = mocks.spawn.mock.results[0]?.value as EventEmitter & {
         killed: boolean;
-        pid?: number;
-        stderr: EventEmitter & { setEncoding: (enc: string) => void };
         kill: (signal?: string) => boolean;
       };
-      child.killed = false;
-      const stderr = new EventEmitter() as EventEmitter & { setEncoding: (enc: string) => void };
-      stderr.setEncoding = () => {};
-      child.stderr = stderr;
-      child.kill = kill;
-      queueMicrotask(() => {
-        child.emit("error", spawnError);
-        child.emit("close", -2, null);
-      });
-      return child;
-    });
+      const signals: string[] = [];
+      child.kill = (signal = "SIGTERM") => {
+        child.killed = true;
+        signals.push(signal);
+        return true;
+      };
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const settled: number[] = [];
+      const waits = [
+        tunnel.stop().then(() => settled.push(1)),
+        tunnel.stop().then(() => settled.push(2)),
+      ];
+      try {
+        await vi.advanceTimersByTimeAsync(exitAfter === "kill" ? 1500 : 0);
+        expect(signals).toEqual(exitAfter === "kill" ? ["SIGTERM", "SIGKILL"] : ["SIGTERM"]);
+        expect(settled).toEqual([]);
+        child.emit("exit", null, exitAfter === "kill" ? "SIGKILL" : "SIGTERM");
+        await Promise.all(waits);
+        expect(settled).toHaveLength(2);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        child.emit("exit", null, "SIGTERM");
+        child.emit("close", null, "SIGTERM");
+        await Promise.all(waits);
+        vi.useRealTimers();
+      }
+    },
+  );
 
+  it("stops an established tunnel when its owner aborts", async () => {
+    spawnFakeSshListening();
+    const controller = new AbortController();
+    const tunnel = await startSshPortForward({
+      target: "me@example.com:2222",
+      localPortPreferred: await getFreePort(),
+      remotePort: 18789,
+      timeoutMs: 1000,
+      signal: controller.signal,
+    });
+    const child = mocks.spawn.mock.results[0]?.value as EventEmitter & { killed: boolean };
+
+    controller.abort();
+
+    await vi.waitFor(() => expect(child.killed).toBe(true));
+    await expect(tunnel.stop()).resolves.toBeUndefined();
+  });
+
+  it("keeps startup abort pending until the SSH child exits", async () => {
+    const child = new EventEmitter() as EventEmitter & {
+      pid: number;
+      stderr: EventEmitter & { setEncoding: (enc: string) => void };
+      kill: (signal?: string) => boolean;
+    };
+    child.pid = 4242;
+    child.stderr = Object.assign(new EventEmitter(), { setEncoding: () => {} });
+    child.kill = vi.fn(() => true);
+    mocks.spawn.mockReturnValue(child);
+    const controller = new AbortController();
     const forwarding = startSshPortForward({
       target: "me@example.com:2222",
-      localPortPreferred: 43210,
+      localPortPreferred: await getFreePort(),
       remotePort: 18789,
-      timeoutMs: 500,
+      timeoutMs: 1000,
+      signal: controller.signal,
     });
-    const rejection = expect(forwarding).rejects.toMatchObject({
-      message: expect.stringContaining("ENOENT"),
-      cause: spawnError,
-    });
+    let settled = false;
+    void forwarding
+      .finally(() => {
+        settled = true;
+      })
+      .catch(() => {});
 
-    await vi.advanceTimersByTimeAsync(0);
-    expect(vi.getTimerCount()).toBe(0);
-    await rejection;
-    expect(kill).toHaveBeenCalledWith("SIGTERM");
+    await vi.waitFor(() => expect(mocks.spawn).toHaveBeenCalledTimes(1));
+    controller.abort();
+    await vi.waitFor(() => expect(child.kill).toHaveBeenCalledWith("SIGTERM"));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(child.kill).toHaveBeenCalledTimes(1);
+
+    child.emit("exit", null, "SIGTERM");
+    await expect(forwarding).rejects.toMatchObject({ name: "AbortError" });
   });
+
+  it.each(
+    ["error", "exit", "abort"].flatMap((terminal) =>
+      ["socket", "retry"].map((pending) => ({ terminal, pending })),
+    ),
+  )(
+    "joins pending readiness $pending before startup rejects on $terminal",
+    async ({ terminal, pending }) => {
+      const localPort = await getFreePort();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      const spawnError = new Error("ENOENT: no such file or directory, spawn /usr/bin/ssh");
+      (spawnError as NodeJS.ErrnoException).code = "ENOENT";
+      const child = Object.assign(new EventEmitter(), {
+        stderr: Object.assign(new EventEmitter(), { setEncoding: () => {} }),
+        kill: vi.fn(() => {
+          queueMicrotask(() => child.emit("close", -2, null));
+          return false;
+        }),
+      });
+      mocks.spawn.mockReturnValue(child);
+      const controller = new AbortController();
+      const abortReason = new Error("startup owner stopped");
+      const socketCreated = createDeferred<net.Socket>();
+      const retryScheduled = createDeferred();
+      const connect = net.connect;
+      const connectSpy = vi.spyOn(net, "connect").mockImplementation((...args) => {
+        // Real refusal exercises the retry; an unconnected Socket holds the other
+        // case at pending I/O without depending on network timing or a remote host.
+        const socket = pending === "retry" ? connect(...args) : new net.Socket();
+        socketCreated.resolve(socket);
+        return socket;
+      });
+      const schedule = globalThis.setTimeout;
+      const timerSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation((...args) => {
+        const timer = schedule(...args);
+        retryScheduled.resolve();
+        return timer;
+      });
+      const forwarding = startSshPortForward({
+        target: "me@example.com:2222",
+        localPortPreferred: localPort,
+        remotePort: 18789,
+        timeoutMs: 500,
+        signal: controller.signal,
+      });
+      const rejection = expect(forwarding).rejects.toMatchObject(
+        terminal === "error"
+          ? { message: expect.stringContaining("ENOENT"), cause: spawnError }
+          : terminal === "exit"
+            ? { message: "ssh exited (1)", cause: expect.any(Error) }
+            : { name: "AbortError", cause: abortReason },
+      );
+      const socket = await socketCreated.promise;
+      try {
+        if (pending === "retry") {
+          await retryScheduled.promise;
+          expect(socket.destroyed).toBe(true);
+          expect(vi.getTimerCount()).toBe(1);
+        }
+        if (terminal === "abort") {
+          controller.abort(abortReason);
+        } else if (terminal === "error") {
+          child.emit("error", spawnError);
+        } else {
+          child.emit("exit", 1, null);
+        }
+        await rejection;
+        expect(socket.closed).toBe(true);
+        expect(vi.getTimerCount()).toBe(0);
+        expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+        await vi.advanceTimersByTimeAsync(500);
+        expect(connectSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        socket.destroy();
+        timerSpy.mockRestore();
+        connectSpy.mockRestore();
+        vi.clearAllTimers();
+      }
+    },
+  );
 
   it.each(["active", "teardown"] as const)(
     "does not crash when stderr errors while the tunnel is %s",
     async (phase) => {
-      vi.useFakeTimers();
+      // Real timers only. The fake spawn opens a real socket, and
+      // waitForLocalListener retries on setTimeout against a Date.now() deadline.
+      // Under fake timers neither advances, so a listener that loses the race on the
+      // first probe hangs to the suite timeout instead of failing on its own budget.
       spawnFakeSshListening();
+      const localPort = await getFreePort();
 
       const tunnel = await startSshPortForward({
         target: "me@example.com:2222",
-        localPortPreferred: 43210,
+        localPortPreferred: localPort,
         remotePort: 18789,
         timeoutMs: 1000,
       });

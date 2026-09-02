@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { i18n } from "../i18n/index.ts";
 import { NativeLinkMenu, type NativeLinkMenuAction } from "./native-link-menu.ts";
+import "./tooltip.ts";
 
 const NATIVE_LINK_MENU_ELEMENT_NAME = `test-openclaw-native-link-menu-${crypto.randomUUID()}`;
 const containers: HTMLElement[] = [];
@@ -104,12 +105,17 @@ describe("native link menu", () => {
     expect(hints).toEqual(["S", "B", "C"]);
 
     document.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "c", bubbles: true, cancelable: true }),
+      new KeyboardEvent("keydown", {
+        key: "с",
+        code: "KeyC",
+        bubbles: true,
+        cancelable: true,
+      }),
     );
     expect(calls).toEqual(["close", "copy"]);
   });
 
-  it("closes on Escape without leaking the key to an underlying dialog", async () => {
+  it("dismisses a tooltip before its menu without leaking either Escape", async () => {
     const trigger = document.createElement("a");
     trigger.href = "https://example.com";
     document.body.append(trigger);
@@ -118,6 +124,28 @@ describe("native link menu", () => {
     const menu = await mountMenu({ trigger, onClose });
     const escaped = vi.fn();
     menu.addEventListener("keydown", escaped);
+    const tooltip = document.createElement("openclaw-tooltip");
+    tooltip.content = "Link action details";
+    tooltip.anchor = menuItems(menu)[0]!;
+    menu.append(tooltip);
+    await tooltip.updateComplete;
+    tooltip.anchor.dispatchEvent(new FocusEvent("focusin", { bubbles: true, composed: true }));
+    const popup = tooltip.shadowRoot!.querySelector("wa-tooltip")!;
+    await popup.updateComplete;
+    expect(popup.open).toBe(true);
+
+    const firstEscape = new KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+    });
+    menu.dispatchEvent(firstEscape);
+
+    expect(popup.open).toBe(false);
+    expect(firstEscape.defaultPrevented).toBe(true);
+    expect(escaped).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(document.activeElement).not.toBe(trigger);
 
     const keydown = new KeyboardEvent("keydown", {
       key: "Escape",
@@ -130,6 +158,26 @@ describe("native link menu", () => {
     expect(escaped).not.toHaveBeenCalled();
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(document.activeElement).toBe(trigger);
+  });
+
+  it("returns focus to its durable trigger before a Tab leaves the menu", async () => {
+    const trigger = document.createElement("a");
+    trigger.href = "https://example.com";
+    document.body.append(trigger);
+    containers.push(trigger);
+    const menu = await mountMenu({ trigger });
+    const item = menuItems(menu)[0];
+    item?.focus();
+
+    const keydown = new KeyboardEvent("keydown", {
+      key: "Tab",
+      bubbles: true,
+      cancelable: true,
+    });
+    item?.dispatchEvent(keydown);
+
+    expect(document.activeElement).toBe(trigger);
+    expect(keydown.defaultPrevented).toBe(false);
   });
 
   it("closes after Web Awesome hides without stealing focus", async () => {

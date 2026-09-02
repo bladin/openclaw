@@ -1,4 +1,14 @@
 import Foundation
+import OpenClawKit
+
+/// Three recovery sources represent the same gateway-owned approval readback.
+/// Preserve their source so cached cards, migration rows, and held Watch actions
+/// share one classifier without losing source-specific cleanup.
+enum WatchApprovalReadbackCandidate<Prompt, PersistedReadback> {
+    case cached(Prompt)
+    case persisted(PersistedReadback)
+    case held(WatchExecApprovalSnapshotRequestItem)
+}
 
 @MainActor
 final class WatchMessageOutbox {
@@ -6,8 +16,7 @@ final class WatchMessageOutbox {
         case dropMissingFields
         case dropMissingTarget
         case deduped(messageID: String)
-        case queue(messageID: String)
-        case forward
+        case queue(event: WatchAppCommandEvent)
     }
 
     // Keep the shipped chat key so upgrades retain messages already queued by the Watch.
@@ -45,7 +54,6 @@ final class WatchMessageOutbox {
 
     func ingest(
         _ event: WatchAppCommandEvent,
-        isAvailable: Bool,
         gatewayStableID: String?) -> Decision
     {
         let messageID = event.commandId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -53,23 +61,30 @@ final class WatchMessageOutbox {
         if messageID.isEmpty || text.isEmpty {
             return .dropMissingFields
         }
-        let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !owner.isEmpty else { return .dropMissingTarget }
+        guard let owner = GatewayStableIdentifier.exact(gatewayStableID) else { return .dropMissingTarget }
         if self.seenMessageIDs.contains(messageID) {
+            // Pending replay resumes the admitted payload; only delivered or foreign work is deduped.
+            if let pending = self.queuedMessages.first(where: {
+                $0.event.commandId == messageID && GatewayStableIdentifier.matches($0.gatewayStableID, owner)
+            }) {
+                return .queue(event: pending.event)
+            }
             return .deduped(messageID: messageID)
         }
         // Persist before network delivery; iOS may suspend a background callback at any await.
+        let queuedEvent = self.message(event, taggedFor: owner)
         self.queuedMessages.append(
-            QueuedMessage(gatewayStableID: owner, event: self.message(event, taggedFor: owner)))
+            QueuedMessage(gatewayStableID: owner, event: queuedEvent))
         self.rebuildSeenMessageIDs()
         self.persistQueue()
-        return isAvailable ? .forward : .queue(messageID: messageID)
+        return .queue(event: queuedEvent)
     }
 
     func recordPromptRoute(promptID: String?, gatewayStableID: String?) {
         let promptID = promptID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let gatewayStableID = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !promptID.isEmpty, promptID != "unknown", !gatewayStableID.isEmpty else { return }
+        guard !promptID.isEmpty, promptID != "unknown",
+              let gatewayStableID = GatewayStableIdentifier.exact(gatewayStableID)
+        else { return }
         self.promptRoutes.removeAll { $0.promptID == promptID }
         self.promptRoutes.append(PromptRoute(promptID: promptID, gatewayStableID: gatewayStableID))
         if self.promptRoutes.count > Self.maxPromptRoutes {
@@ -84,39 +99,32 @@ final class WatchMessageOutbox {
         return self.promptRoutes.last { $0.promptID == promptID }?.gatewayStableID
     }
 
-    func nextQueuedMessage(isAvailable: Bool, gatewayStableID: String?) -> WatchAppCommandEvent? {
-        let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard isAvailable, !owner.isEmpty else { return nil }
+    func nextQueuedMessage(
+        isAvailable: Bool,
+        gatewayStableID: String?,
+        excludingMessageIDs: Set<String> = []) -> WatchAppCommandEvent?
+    {
+        guard isAvailable, let owner = GatewayStableIdentifier.exact(gatewayStableID) else { return nil }
         // Replies are time-sensitive; a retrying chat must not strand them behind it.
-        if let reply = self.queuedMessages.first(where: {
-            $0.gatewayStableID == owner && self.kind(of: $0.event) == .quickReply
-        }) {
-            return reply.event
+        var oldest: WatchAppCommandEvent?
+        for queued in self.queuedMessages where
+            GatewayStableIdentifier.matches(queued.gatewayStableID, owner) &&
+            !excludingMessageIDs.contains(queued.event.commandId)
+        {
+            if self.kind(of: queued.event) == .quickReply { return queued.event }
+            if oldest == nil { oldest = queued.event }
         }
-        return self.queuedMessages.first { $0.gatewayStableID == owner }?.event
+        return oldest
     }
 
     func removeQueuedMessage(messageID: String, gatewayStableID: String?) {
         let messageID = messageID.trimmingCharacters(in: .whitespacesAndNewlines)
-        let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !messageID.isEmpty, !owner.isEmpty else { return }
+        guard !messageID.isEmpty, let owner = GatewayStableIdentifier.exact(gatewayStableID) else { return }
         guard let index = self.queuedMessages.firstIndex(where: {
-            $0.gatewayStableID == owner && $0.event.commandId == messageID
+            GatewayStableIdentifier.matches($0.gatewayStableID, owner) && $0.event.commandId == messageID
         }) else { return }
         self.queuedMessages.remove(at: index)
         self.rememberRecentMessageID(messageID)
-        self.persistQueue()
-    }
-
-    func requeueFront(_ event: WatchAppCommandEvent, gatewayStableID: String?) {
-        let messageID = event.commandId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let owner = gatewayStableID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !messageID.isEmpty, !owner.isEmpty else { return }
-        self.queuedMessages.removeAll { $0.event.commandId == messageID }
-        self.queuedMessages.insert(
-            QueuedMessage(gatewayStableID: owner, event: self.message(event, taggedFor: owner)),
-            at: 0)
-        self.rebuildSeenMessageIDs()
         self.persistQueue()
     }
 
@@ -141,10 +149,14 @@ final class WatchMessageOutbox {
 
         var seenSet = Set<String>()
         self.queuedMessages = persisted.compactMap { queued in
-            let owner = queued.gatewayStableID.trimmingCharacters(in: .whitespacesAndNewlines)
             let messageID = queued.event.commandId.trimmingCharacters(in: .whitespacesAndNewlines)
             let text = queued.event.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !owner.isEmpty, !messageID.isEmpty, !text.isEmpty, seenSet.insert(messageID).inserted else {
+            guard let owner = GatewayStableIdentifier.exact(queued.gatewayStableID),
+                  !messageID.isEmpty,
+                  !text.isEmpty,
+                  !self.recentMessageIDs.contains(messageID),
+                  seenSet.insert(messageID).inserted
+            else {
                 return nil
             }
             return QueuedMessage(gatewayStableID: owner, event: self.message(queued.event, taggedFor: owner))
@@ -181,8 +193,9 @@ final class WatchMessageOutbox {
 
         for rawRoute in metadata.promptRoutes {
             let promptID = rawRoute.promptID.trimmingCharacters(in: .whitespacesAndNewlines)
-            let gatewayStableID = rawRoute.gatewayStableID.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !promptID.isEmpty, promptID != "unknown", !gatewayStableID.isEmpty else { continue }
+            guard !promptID.isEmpty, promptID != "unknown",
+                  let gatewayStableID = GatewayStableIdentifier.exact(rawRoute.gatewayStableID)
+            else { continue }
             self.promptRoutes.removeAll { $0.promptID == promptID }
             self.promptRoutes.append(PromptRoute(promptID: promptID, gatewayStableID: gatewayStableID))
         }

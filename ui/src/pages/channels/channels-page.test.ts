@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { GatewayBrowserClient } from "../../api/gateway.ts";
+import { createDeferred } from "../../../../test/helpers/promise.js";
+import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
 import type { NostrProfile } from "../../api/types.ts";
 import type { ApplicationContext, ApplicationGatewaySnapshot } from "../../app/context.ts";
 import { createChannelCapability } from "../../lib/channels/index.ts";
-import { createRuntimeConfigCapability } from "../../lib/config/index.ts";
+import { createRuntimeConfigCapability } from "../../lib/config/runtime-config-capability.ts";
 import "./channels-page.ts";
 
 const NOSTR_PROFILE_REQUEST_TIMEOUT_MS = 30_000;
@@ -12,6 +13,12 @@ type ChannelsPageTestElement = HTMLElement & {
   context: ApplicationContext;
   updateComplete: Promise<boolean>;
   requestUpdate: () => void;
+};
+
+type PairingTestPage = ChannelsPageTestElement & {
+  pairingAccountFilter: string | null;
+  pairingChannelFilter: string | null;
+  pairingPrompt: object | null;
 };
 
 type NostrTestPage = ChannelsPageTestElement & {
@@ -31,17 +38,6 @@ type TestGateway = ApplicationContext["gateway"] & {
   emit: (patch: Partial<ApplicationGatewaySnapshot>) => void;
 };
 
-function createDeferred<T>() {
-  let resolve: ((value: T) => void) | undefined;
-  const promise = new Promise<T>((res) => {
-    resolve = res;
-  });
-  if (!resolve) {
-    throw new Error("Expected deferred callback to be initialized");
-  }
-  return { promise, resolve };
-}
-
 function stubHangingFetch() {
   const fetchMock = vi.fn<typeof fetch>(
     async (_input, init) =>
@@ -58,11 +54,32 @@ function stubHangingFetch() {
 }
 
 function createGateway(): TestGateway {
-  const client = { request: vi.fn(async () => ({})) } as unknown as GatewayBrowserClient;
+  const client = {
+    request: vi.fn(async (method: string) =>
+      method === "channels.pairing.list"
+        ? {
+            accounts: [],
+            requests: [],
+            commandOwnerConfigured: true,
+            limits: { pendingPerAccount: 3, ttlMs: 3_600_000 },
+          }
+        : method === "channels.status"
+          ? {
+              ts: 0,
+              channelOrder: [],
+              channelLabels: {},
+              channels: {},
+              channelAccounts: {},
+              channelDefaultAccountId: {},
+            }
+          : {},
+    ),
+  } as unknown as GatewayBrowserClient;
   const snapshot: ApplicationGatewaySnapshot = {
     client,
-    connected: true,
-    reconnecting: false,
+    phase: "connected",
+    offlineStable: false,
+    canvasPluginSurfaceUrl: null,
     hello: null,
     assistantAgentId: null,
     sessionKey: "main",
@@ -140,6 +157,136 @@ describe("ChannelsPage lifecycle", () => {
     second.channels.dispose();
   });
 
+  it("refreshes pairing data when the authorized scope set changes", async () => {
+    const gateway = createGateway();
+    gateway.emit({
+      hello: {
+        auth: { role: "operator", scopes: ["operator.pairing"] },
+      } as unknown as ApplicationGatewaySnapshot["hello"],
+    });
+    const source = createContext(gateway);
+    source.channels.state.pairingSnapshot = {
+      accounts: [],
+      requests: [],
+      commandOwnerConfigured: true,
+      limits: { pendingPerAccount: 3, ttlMs: 3_600_000 },
+    };
+    const refreshPairing = vi.spyOn(source.channels, "refreshPairing").mockResolvedValue();
+    const page = document.createElement("openclaw-channels-page") as PairingTestPage;
+    page.context = source.context;
+    document.body.append(page);
+    await page.updateComplete;
+    refreshPairing.mockClear();
+    page.pairingPrompt = {};
+    page.pairingChannelFilter = "whatsapp";
+    page.pairingAccountFilter = "personal";
+
+    gateway.emit({
+      hello: {
+        auth: { role: "operator", scopes: ["operator.pairing", "operator.read"] },
+      } as unknown as ApplicationGatewaySnapshot["hello"],
+    });
+
+    await vi.waitFor(() => expect(refreshPairing).toHaveBeenCalled());
+    expect(page.pairingPrompt).toBeNull();
+    expect(page.pairingChannelFilter).toBeNull();
+    expect(page.pairingAccountFilter).toBeNull();
+    source.runtimeConfig.dispose();
+    source.channels.dispose();
+  });
+
+  it("keeps rejected channel configuration visible in its editor without reloading the draft", async () => {
+    const gateway = createGateway();
+    gateway.emit({
+      hello: {
+        auth: { role: "operator", scopes: ["operator.admin", "operator.read"] },
+        features: { methods: ["config.set", "config.schema"] },
+      } as unknown as ApplicationGatewaySnapshot["hello"],
+    });
+    const source = createContext(gateway);
+    const config = { channels: { whatsapp: { enabled: true } } };
+    const channel = {
+      configured: true,
+      linked: true,
+      running: true,
+      connected: true,
+      reconnectAttempts: 0,
+    };
+    source.channels.state.channelsSnapshot = {
+      ts: 0,
+      channelOrder: ["whatsapp"],
+      channelLabels: { whatsapp: "WhatsApp" },
+      channels: { whatsapp: channel },
+      channelAccounts: {},
+      channelDefaultAccountId: {},
+    };
+    source.channels.state.pairingSnapshot = {
+      accounts: [],
+      requests: [],
+      commandOwnerConfigured: true,
+      limits: { pendingPerAccount: 3, ttlMs: 3_600_000 },
+    };
+    Object.assign(source.runtimeConfig.state, {
+      configSnapshot: { config, hash: "test", raw: JSON.stringify(config) },
+      configForm: structuredClone(config),
+      configFormOriginal: structuredClone(config),
+      configDraftBaseHash: "test",
+      configSchema: {
+        type: "object",
+        properties: {
+          channels: {
+            type: "object",
+            properties: {
+              whatsapp: {
+                type: "object",
+                properties: { enabled: { type: "boolean", title: "Enabled" } },
+              },
+            },
+          },
+        },
+      },
+      configUiHints: { "channels.whatsapp.enabled": { advanced: false } },
+    });
+    const refreshConfig = vi.spyOn(source.runtimeConfig, "refresh");
+    const refreshChannels = vi.spyOn(source.channels, "refresh");
+    const request = vi.spyOn(gateway.snapshot.client!, "request");
+    request.mockRejectedValueOnce(
+      new GatewayRequestError({
+        code: "INVALID_REQUEST",
+        message:
+          "channel rejected: OPENAI_API_KEY=sk-1234567890abcdef <img src=x onerror=alert(1)>",
+      }),
+    );
+    const page = document.createElement("openclaw-channels-page") as ChannelsPageTestElement;
+    page.context = source.context;
+    document.body.append(page);
+    await page.updateComplete;
+
+    page.querySelector<HTMLButtonElement>(".channels-item")!.click();
+    await page.updateComplete;
+    source.runtimeConfig.patchForm(["channels", "whatsapp", "enabled"], false);
+    await page.updateComplete;
+    const save = page.querySelector<HTMLButtonElement>(".channels-detail .btn.primary")!;
+    expect(save.disabled).toBe(false);
+    save.click();
+
+    await vi.waitFor(() => {
+      const alert = page.querySelector<HTMLElement>(".channels-detail [role=alert]");
+      expect(alert?.textContent).toContain("channel rejected");
+      expect(alert?.textContent).toContain("OPENAI_API_KEY=sk-123...cdef");
+      expect(alert?.textContent).not.toContain("sk-1234567890abcdef");
+      expect(alert?.querySelector("img")).toBeNull();
+    });
+    expect(source.runtimeConfig.state.configFormDirty).toBe(true);
+    expect(source.runtimeConfig.state.configForm).toEqual({
+      channels: { whatsapp: { enabled: false } },
+    });
+    expect(refreshConfig).not.toHaveBeenCalled();
+    expect(refreshChannels).not.toHaveBeenCalled();
+    source.runtimeConfig.dispose();
+    source.channels.dispose();
+  });
+
   it("drops a profile save when the channel source is replaced", async () => {
     const gateway = createGateway();
     const first = createContext(gateway);
@@ -194,7 +341,7 @@ describe("ChannelsPage lifecycle", () => {
 
     const load = page.importNostrProfile();
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    gateway.emit({ connected: false });
+    gateway.emit({ phase: "stopped" });
     expect(page.nostrProfileFormState).toBeNull();
 
     response.resolve(

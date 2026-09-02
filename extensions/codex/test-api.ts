@@ -4,13 +4,14 @@
  */
 import type {
   AnyAgentTool,
-  EmbeddedRunAttemptParams,
+  EmbeddedRunAttemptParamsV2 as EmbeddedRunAttemptParams,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
+import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
 import {
   type CodexAppServerRuntimeOptions,
   resolveCodexAppServerRuntimeOptions,
+  type CodexPluginConfig,
 } from "./src/app-server/config.js";
-import type { CodexPluginConfig } from "./src/app-server/config.js";
 import { filterCodexDynamicTools } from "./src/app-server/dynamic-tool-profile.js";
 import { createCodexDynamicToolBridge } from "./src/app-server/dynamic-tools.js";
 import type { CodexDynamicToolSpec, JsonObject } from "./src/app-server/protocol.js";
@@ -20,6 +21,19 @@ import {
   buildThreadStartParams,
   buildTurnStartParams,
 } from "./src/app-server/thread-lifecycle.js";
+
+export { CODEX_APP_SERVER_VERSION } from "./src/app-server/version.js";
+
+/** Keeps host integration tests on the plugin's test boundary without exposing runtime internals. */
+export async function createCodexSessionInitializationFixtureForTest(params: {
+  runtime: PluginRuntime;
+  workspaceDir: string;
+}) {
+  // Snapshot scripts also load this barrel outside Vitest; load its test fixture only on demand.
+  const { createCodexSessionInitializationFixture } =
+    await import("./src/app-server/session-initialization.test-support.js");
+  return await createCodexSessionInitializationFixture(params);
+}
 
 type CodexHarnessPromptSnapshot = {
   developerInstructions: string;
@@ -50,7 +64,6 @@ export function buildCodexHarnessPromptSnapshot(params: {
   promptText?: string;
   developerInstructionAdditions?: string;
   turnScopedDeveloperInstructions?: string;
-  heartbeatCollaborationInstructions?: string;
 }): CodexHarnessPromptSnapshot {
   const developerInstructions = joinPresentSections(
     buildDeveloperInstructions(params.attempt, {
@@ -79,7 +92,6 @@ export function buildCodexHarnessPromptSnapshot(params: {
       appServer: params.appServer,
       promptText: params.promptText,
       turnScopedDeveloperInstructions: params.turnScopedDeveloperInstructions,
-      heartbeatCollaborationInstructions: params.heartbeatCollaborationInstructions,
     }),
   };
 }
@@ -102,3 +114,4 @@ export function createCodexDynamicToolSpecsForPromptSnapshot(params: {
     directToolNames: params.directToolNames,
   }).specs;
 }
+export { createCanonicalForkFixture as createCanonicalForkFixtureForTest } from "./src/app-server/canonical-fork.test-support.js";
